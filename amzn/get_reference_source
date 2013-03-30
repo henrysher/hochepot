@@ -1,0 +1,368 @@
+#!/usr/bin/python
+
+__version__ = '1.2'
+__author__ = 'Amazon Web Services, Inc.'
+__license__ = 'Amazon Software License (http://aws.amazon.com/asl/)'
+
+import math
+import re
+import sys
+import rpm
+import os.path
+import urllib
+import urllib2
+import socket
+import tempfile
+
+DEFAULT_WEBSERVICE_URI = ('https://alami-source-request.amazonaws.com/'
+                          'cgi-bin/source_request.cgi')
+VERSION = '2011-08-01'
+
+
+class Console:
+    """ Class that provides access to out, err and debug streams """
+
+    def __init__(self, debug):
+        self.debug_mode = debug
+
+    def stdout(self, msg):
+        print msg
+
+    def stderr(self, msg):
+        print >> sys.stderr, msg
+
+    def debug(self, msg):
+        if self.debug_mode:
+            self.stderr(msg)
+
+
+class ErrorHandler:
+    """ Convenient wrapper class to handle various exceptions """
+
+    def __init__(self, console, request_type, uri):
+        assert request_type in ('S3', 'webservice', 'meta-data service')
+        self.request_type = request_type
+        self.console = console
+        self.uri = uri
+
+    def handle(self, error):
+        if isinstance(error, urllib2.HTTPError):
+            self.httperror(error)
+        elif isinstance(error, urllib2.URLError):
+            self.urlerror(error)
+        elif isinstance(error, socket.timeout):
+            self.timeout(error)
+        else:
+            self.generic(error)
+        return
+
+    def httperror(self, http_error):
+        if http_error.code == 403:
+            console.stderr("403 Forbidden - please confirm you are running "
+                           "this tool from inside EC2. Unable to continue.")
+        elif http_error.code == 404:
+            console.stderr("404 File Not Found - please confirm the package "
+                           "you are requesting source for is vended by AWS.")
+        elif http_error.code == 500:
+            console.debug("Received: %s [%s] " % (http_error.code,
+                http_error.msg))
+            console.stderr("500 Internal Server Error - please try again "
+                           "later.")
+        else:
+            console.debug("Received unrecognized HTTP response code '%d' "
+                          "from %s." % (http_error.code, self.request_type))
+            console.debug("Requested address: %s" % (self.uri))
+            console.debug("Full response header: %s [%s]" % (http_error.code,
+                http_error.msg))
+
+    def urlerror(self, url_error):
+        console.debug("Unexpected URLError while requesting remote address "
+                      "(%s): %s" % (self.request_type, self.uri))
+        console.stderr("Unable to access %s - please wait awhile and try "
+                       "again, or try again with '--debug' for more "
+                       "information." % (self.request_type))
+
+    def timeout(self, timeout_error):
+        console.stderr("Timed out while attempting to reach %s address: %s" %
+                (self.request_type, self.uri))
+
+    def generic(self, generic_error):
+        console.debug("Generalized error: %s" % (str(generic_error)))
+        console.debug("Requested address: %s" % (self.uri))
+        console.stderr("Generalized non-recoverable error while contacting "
+                       "%s - please wait awhile and try again, or try again "
+                       "with '--debug' for more information."
+                       % (self.request_type))
+
+
+def __interpret_given_args():
+    from optparse import OptionParser
+
+    parser = OptionParser(usage="usage: %prog [-d] <-p package> ",
+            version=__version__)
+
+    parser.add_option("-d", "--debug",
+                       action="store_true", dest="debug", default=False,
+                       help=("enables debug mode, to assist in analyzing "
+                             "any failures"))
+    parser.add_option("-p", "--package",
+                       action="store", type="string", dest="pkg",
+                       help="specifies which package to acquire source for")
+    parser.add_option("-w", "--webservice-uri",
+                       action="store", type="string", dest="webservice_uri",
+                       default=DEFAULT_WEBSERVICE_URI,
+                       help=("specifies the address of the webservice "
+                             "responsible for finding the source code "
+                             "location; default is: " +
+                             DEFAULT_WEBSERVICE_URI))
+
+    (options, args) = parser.parse_args()
+
+    if not options.pkg:
+        print >> sys.stderr, ("Sorry, please use the '-p' or '--package' "
+                              "option to specify the package you would like "
+                              "source for.")
+        print >> sys.stderr
+        parser.print_help()
+        sys.exit(1)
+
+    return (options, args)
+
+
+def __confirm_amazon_linux_ami(console):
+    if not os.path.exists('/etc/system-release') or (not
+            os.path.isfile('/etc/system-release')):
+        console.debug("Unable to confirm pre-read() existence of "
+                      "'/etc/system-release'")
+        return False
+    else:
+        try:
+            system_release_fh = open('/etc/system-release', 'r')
+        except IOError, error:
+            console.debug("Unable to open() '/etc/system-release': %s" %
+                    (str(error)))
+            return False
+        else:
+            top_line = system_release_fh.readline()
+            if not top_line:
+                console.debug("Unable to to process contents of "
+                              "'/etc/system-release'")
+                return False
+            else:
+                if not re.match(r'^Amazon Linux AMI ', top_line):
+                    console.debug("Contents of '/etc/system-release' are "
+                                  "not as expected.")
+                    return False
+                else:
+                    return True
+
+
+def __find_pkgs_in_local_db(console, pkg):
+    ts = rpm.ts()
+    matches = {}
+    epoch = None
+    arch = None
+
+    # epoch pattern
+    ep = re.compile('-(\d+):')
+    if ep.search(pkg):
+        n, e, vr = ep.split(pkg, 1)
+        pkg, epoch = '-'.join((n, vr)), e
+
+    # all archs present on the system
+    archs = set(h['arch'] for h in ts.dbMatch())
+    # get arch from a possible .arch part of the string
+    if pkg.rsplit('.', 1)[-1] in archs:
+        pkg, arch = pkg.rsplit('.', 1)
+
+    # search the database for possible matches on all splits of pkg
+    # example: foo-1.0-0 could mean any of
+    #     n=foo,v=1.0,r=0
+    #     n=foo-1.0,v=0
+    #     n=foo-1.0-0
+    for i in range(min(pkg.count('-')+1, 3)):
+        s = pkg.rsplit('-', i)
+        mi = ts.dbMatch()
+        mi.pattern('name', rpm.RPMMIRE_STRCMP, s[0])
+        if len(s) > 1:
+            mi.pattern('version', rpm.RPMMIRE_STRCMP, s[1])
+        if len(s) > 2:
+            mi.pattern('release', rpm.RPMMIRE_STRCMP, s[2])
+        if epoch:
+            mi.pattern('epoch', rpm.RPMMIRE_STRCMP, epoch)
+        if arch:
+            mi.pattern('arch', rpm.RPMMIRE_STRCMP, arch)
+        matches.update(dict((h['sourcerpm'], h) for h in mi))
+
+    # hooray for gpg keys as rpm entries!
+    if '(none)' in matches:
+        del matches['(none)']
+
+    return matches
+
+def __display_running_parameters(console, options, requested_pkgs, instance_id,
+        region):
+    console.stdout("")
+    console.stdout("Requested package: %s" % (options.pkg))
+    for sourcerpm in requested_pkgs:
+        console.stdout("Found package from local RPM database: %s" %
+                (requested_pkgs[sourcerpm]['NEVRA']))
+        console.stdout("Corresponding source RPM to found package : %s" %
+                (sourcerpm))
+        console.stdout("")
+    console.debug("Debug mode: Enabled")
+    console.debug("Instance-id : %s" % (instance_id))
+    console.debug("Region : %s" % (region))
+    console.debug("")
+
+
+def __prompt_to_continue():
+    input = raw_input("Are these parameters correct? Please type 'yes' to "
+                      "continue: ")
+    if input.lower() in ['y', 'yes']:
+        return True
+    else:
+        return False
+
+
+def __find_pkg_srpm_uri(console, requested_pkg, instance_id, region,
+    http_headers, webservice_uri):
+    request_data_values = {'srpm_name': requested_pkg['sourcerpm'],
+            'instance_id': instance_id, 'region': region, 'version':
+            VERSION}
+    request_data = urllib.urlencode(request_data_values)
+    request = urllib2.Request(webservice_uri, request_data, http_headers)
+
+    try:
+        api_response = urllib2.urlopen(request)
+    except Exception, generic_error:
+        return ErrorHandler(console, 'webservice',
+                webservice_uri).handle(generic_error)
+
+    try:
+        api_response_data = api_response.read()
+    except Exception, generic_error:
+        return ErrorHandler(console, 'webservice',
+                webservice_uri).handle(generic_error)
+
+    return api_response_data.rstrip("\r\n")
+
+
+def __download_pkg_srpm(pkg_srpm_uri, requested_pkg, instance_id, region,
+        http_headers):
+    pkg_local_dir = '/usr/src/srpm/debug'
+    pkg_local_srpm_name = os.path.join(pkg_local_dir,
+            requested_pkg['sourcerpm'])
+    request = urllib2.Request(pkg_srpm_uri, None, http_headers)
+
+
+    try:
+        pkg_local_tmp_fd, pkg_local_tmp_name = tempfile.mkstemp(
+                dir=pkg_local_dir)
+        pkg_local_tmp_fh = os.fdopen(pkg_local_tmp_fd, 'wb')
+    except IOError, io_error:
+        console.stderr("Unable to open temporary output file: %s" %
+                (str(io_error)))
+        return
+
+    try:
+        pkg_remote_fh = urllib2.urlopen(request, timeout=120)
+        BUFFER = 1024 * 8
+        while True:
+            buffer = pkg_remote_fh.read(BUFFER)
+            if not buffer: break
+            pkg_local_tmp_fh.write(buffer)
+        pkg_remote_fh.close()
+        pkg_local_tmp_fh.close()
+        os.rename(pkg_local_tmp_name, pkg_local_srpm_name)
+    except IOError, io_error:
+        pkg_local_tmp_fh.close()
+        os.remove(pkg_local_tmp_name)
+        console.stderr("Error while writing out SRPM to file '%s': %s" %
+                (pkg_local_tmp_name, str(io_error)))
+        return
+    except Exception, generic_error:
+        pkg_local_tmp_fh.close()
+        os.remove(pkg_local_tmp_name)
+        return ErrorHandler(console, 'S3', pkg_srpm_uri).handle(generic_error)
+
+    return pkg_local_srpm_name
+
+
+def __retrieve_instanceid_region(console):
+    # retrieve only instance-id and region. fallback in case the metadata
+    # service isn't available or isn't populated (which happens during targeted
+    # launches)
+    instance_id = 'NA'
+    request = 'http://169.254.169.254/latest/meta-data/instance-id'
+
+    try:
+        instance_id = urllib2.urlopen(request, timeout=120).read().strip()
+    except Exception, generic_error:
+        ErrorHandler(console, 'meta-data service',
+                request).handle(generic_error)
+
+    region = 'NA'
+    request = ('http://169.254.169.254/latest/meta-data/placement'
+               '/availability-zone')
+
+    try:
+        region = urllib2.urlopen(request, timeout=120).read().strip()[:-1]
+    except Exception, generic_error:
+        ErrorHandler(console, 'meta-data service',
+                request).handle(generic_error)
+
+    return (instance_id, region)
+
+if __name__ == '__main__':
+    (options, args) = __interpret_given_args()
+    console = Console(debug=options.debug)
+
+    if not __confirm_amazon_linux_ami(console):
+        console.stderr("Sorry, it doesn't appear this is being run on the "
+                       "Amazon Linux AMI. Unable to continue.")
+        sys.exit(1)
+
+    (instance_id, region) = __retrieve_instanceid_region(console)
+
+    requested_pkgs = __find_pkgs_in_local_db(console, options.pkg)
+    if not requested_pkgs:
+        console.stdout("No source rpm found for: %s" % options.pkg)
+        console.stdout("Please install the binary package for which you have "
+                       "requested source.")
+        sys.exit(1)
+
+    __display_running_parameters(console, options, requested_pkgs, instance_id,
+            region)
+
+    if __prompt_to_continue():
+        status = 0
+        for sourcerpm in requested_pkgs:
+            http_headers = {'X-GRS-Requested-SRPM': sourcerpm,
+                    'X-GRS-Instance-Id': instance_id, 'X-GRS-Region': region,
+                    'User-agent': "get_reference_source (ALAMI, '%s', '%s')" %
+                    (__version__, __author__)}
+    
+            pkg_srpm_uri = __find_pkg_srpm_uri(console, requested_pkgs[sourcerpm],
+                    instance_id, region, http_headers, options.webservice_uri)
+    
+            if not pkg_srpm_uri:
+                console.stdout("Unable to determine location of source rpm for "
+                               "this package.")
+                sys.exit(1)
+            else:
+                console.debug("Package SRPM is located at: %s" % pkg_srpm_uri)
+    
+            pkg_local_location = __download_pkg_srpm(pkg_srpm_uri, requested_pkgs[sourcerpm],
+                    instance_id, region, http_headers)
+    
+            if pkg_local_location:
+                console.stdout("Source RPM downloaded to: %s" %
+                        (pkg_local_location))
+            else:
+                console.stdout("Unable to download source RPM.")
+                status += 1
+
+        sys.exit(status)
+    else:
+        sys.exit(0)
