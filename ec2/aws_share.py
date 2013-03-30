@@ -3,12 +3,23 @@
 REGIONS = {
         'ue': 'us-east-1',
         'uw1': 'us-weat-1',
-	    'uw2': 'us-west-2',
-	    'as': 'ap-southeast-1',
-		'an': 'ap-northeast-1',
+	'uw2': 'us-west-2',
+	'as': 'ap-southeast-1',
+	'as2': 'ap-southeast-2',
+	'an': 'ap-northeast-1',
 }
-
-All_Roles = ['AdminPortal', 'Alert', 'ForwardProxy', 'LogWriter', 'ProfileCache', 'ScannerDy', 'VpcLdapAuthSync', 'Cacti', 'Monitor', 'Splunk']
+ICS_ROLES = ["AdminPortal",
+        "Alert",
+        "ForwardProxy",
+        "LogWriter",
+        "Misc",
+        "Monitor",
+        "ProfileCache",
+        "ScannerDy",
+        # Note: ScannerSt's AMI = ScannerDy's AMI
+        # "ScannerSt",
+        "Splunk",
+        "VpcLdapAuthSync"]
 
 import ConfigParser
 
@@ -81,70 +92,118 @@ if __name__ == "__main__":
         print "accounts are not found in %s..." % (options.keycfg)
         sys.exit(0)
 
-    if options.region not in REGIONS:
-        print "this region %s is not valid..." % (options.region)
-        sys.exit(0)
-		
-    if not options.build or not options.role:
-        print "no build or role specified..."
-        sys.exit(0)
-
-    awskey = first_awskey
-    print awskey
-    ec2conn = boto.connect_ec2(region=get_region(REGIONS[options.region]),
-							   aws_access_key_id=awskey['aws_access_key_id'],
-							   aws_secret_access_key=awskey['aws_secret_access_key'])
-
-    image_filters={'tag:Role':options.role,'tag:Version':options.build}
-    ec2images = getImages(ec2conn, image_filters)
-    # print ec2images
-    if len(ec2images) != 1:
-        print "Too many/no roles are found in the image under Role %s and Version %s" % (options.role, options.build)
-        sys.exit(0)
-
-    image_id = ec2images[0].id
-    print "Image ID: %s" % image_id
-
-    ec2tags = getImageTags(ec2conn, image_id)
-
-    tags = {}
-    for tag in ec2tags:
-		tags[tag.name] = tag.value
-
-    print tags
-    permits = getImagePermissions(ec2images[0])
-    #print permits
-    if "user_ids" in permits:
-        permits = permits["user_ids"]
+    regions = []
+    if not options.region:
+        print "no region specified..."
+    
+    if options.region.lower() == "all":
+        regions = REGIONS.keys()
     else:
-        permits = []
-    #print permits
-    permits.append(second_awskey["account_number"])
-    #print permits
-    setImagePermissions(ec2images[0], permits)
-    permits = getImagePermissions(ec2images[0])
-    #print permits
+        for region in options.region.split(","):
+            if region not in REGIONS:
+                print "this region %s is not valid..." % (region)
+                sys.exit(0)
+            regions.append(region)
+        
+    roles = []
+    if not options.role:
+        print "no role specified..."
 
-    ec2conn.close()
+    if options.role.lower() == "all":
+        roles = ICS_ROLES
+    else:
+        for role in options.role.split(","):
+            if role not in ICS_ROLES:
+                print "this role %s is not valid..." % (role)
+                sys.exit(0)
+            roles.append(role)
+		
+    if not options.build:
+        print "no build specified..."
+        sys.exit(0)
 
-    awskey = second_awskey
-    print awskey
-    ec2conn = boto.connect_ec2(region=get_region(REGIONS[options.region]),
-							   aws_access_key_id=awskey['aws_access_key_id'],
-							   aws_secret_access_key=awskey['aws_secret_access_key'])
+    skipped = {}
 
-    # print ec2conn
-    #print image_id
-    ec2tags = getImageTags(ec2conn, image_id)
-    tags_old = {}
-    for tag in ec2tags:
-		tags_old[tag.name] = tag.value
-    print tags_old
-    setImageTags(ec2conn, image_id, tags)
-    ec2tags = getImageTags(ec2conn, image_id)
-    tags_new = {}
-    for tag in ec2tags:
-		tags_new[tag.name] = tag.value
-    print tags_new
+    for region in regions:
+        print "----------------------------------------------------------"
+        print "===> Region:\t", region
+        print "----------------------------------------------------------"
+        skipped[region] = []
+        for role in roles: 
+            print "====> Role:\t", role 
+            awskey = first_awskey
+            print "=====> Switch to first account:", options.first_account, awskey["account_number"]
+            ec2conn = boto.connect_ec2(region=get_region(REGIONS[region]),
+    							   aws_access_key_id=awskey['aws_access_key_id'],
+    							   aws_secret_access_key=awskey['aws_secret_access_key'])
+            image_filters={'tag:Role':role,'tag:Version':options.build}
+            ec2images = getImages(ec2conn, image_filters)
+            # print ec2images
+            if len(ec2images) != 1:
+                skipped[region].append(role)
+                print "++++++ Error found but skipped : Too many/no such role in the image tags\n"
+                continue
+                #sys.exit(0)
+        
+            image_id = ec2images[0].id
+            print "=====> Image ID: %s" % image_id
+        
+            ec2tags = getImageTags(ec2conn, image_id)
+        
+            tags = {}
+            for tag in ec2tags:
+        		tags[tag.name] = tag.value
+        
+            print "=====> AMI Tags: ", tags
+            permits = getImagePermissions(ec2images[0])
+            #print permits
+            if "user_ids" in permits:
+                permits = permits["user_ids"]
+            else:
+                permits = []
+            #print permits
+            permits.append(second_awskey["account_number"])
+            #print permits
+            setImagePermissions(ec2images[0], permits)
+            permits = getImagePermissions(ec2images[0])
+            #print permits
+        
+            ec2conn.close()
+        
+            print "=====> Share AMI now...."
+            awskey = second_awskey
+            print "=====> Switch to second account:", options.second_account, awskey["account_number"]
+            ec2conn = boto.connect_ec2(region=get_region(REGIONS[region]),
+        							   aws_access_key_id=awskey['aws_access_key_id'],
+        							   aws_secret_access_key=awskey['aws_secret_access_key'])
+        
+            #print image_id
+            ec2tags = getImageTags(ec2conn, image_id)
+            tags_old = {}
+            for tag in ec2tags:
+        		tags_old[tag.name] = tag.value
+            #print tags_old
+            setImageTags(ec2conn, image_id, tags)
+            ec2tags = getImageTags(ec2conn, image_id)
+            tags_new = {}
+            for tag in ec2tags:
+        		tags_new[tag.name] = tag.value
+            print "=====> New AMI Tags:\t", tags_new
+            print "++++++ Done ++++++\n"
+        
+            ec2conn.close()
+    
+    print "-----------------------------------------"
+    print "|            Final Result               |"
+    print "-----------------------------------------"
 
-    ec2conn.close()
+    flag = 0
+    for region in regions:
+        if len(skipped[region]) > 0:
+            print "---> Region: \t", region
+            print "----> Failed Roles: \t", skipped[region]
+            flag = 1
+    if flag == 1:
+        print "\n"
+    else:
+        print "Successfuly finished...\n"
