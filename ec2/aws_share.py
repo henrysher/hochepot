@@ -3,10 +3,10 @@
 REGIONS = {
         'ue': 'us-east-1',
         'uw1': 'us-weat-1',
-	'uw2': 'us-west-2',
-	'as': 'ap-southeast-1',
-	'as2': 'ap-southeast-2',
-	'an': 'ap-northeast-1',
+	    'uw2': 'us-west-2',
+	    'as': 'ap-southeast-1',
+	    'as2': 'ap-southeast-2',
+	    'an': 'ap-northeast-1',
 }
 ICS_ROLES = ["AdminPortal",
         "Alert",
