@@ -32,6 +32,7 @@ BuildArch:      noarch
 {{ dependencies(data.runtime_deps) }}
 BuildRequires:  python27-env
 BuildRequires:  python27-python-setuptools
+BuildRequires:  python27-python-devel
 Requires:   python27-env
 BuildRequires:  devtoolset-2-gcc
 BuildRequires:  devtoolset-2-binutils
