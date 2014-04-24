@@ -1,4 +1,7 @@
 #!/bin/bash
+# Utility to configure instance timezone on AWS
+# 2014/04/24
+
 timezone() {
     case $1 in
         'us-east-1') echo "US/Eastern";;
@@ -11,7 +14,9 @@ timezone() {
         *) return 255;;
     esac
 }
+
 LOG="SET_TIMEZONE"
+
 REGION_URL="http://169.254.169.254/latest/meta-data/placement/availability-zone"
 AZ_ID=`curl --retry 3 --retry-delay 0 --silent --fail ${REGION_URL}`
 if [ $? -ne 0 ] ; then
@@ -21,13 +26,15 @@ else
    REGION=${AZ_ID:0:${#AZ_ID} - 1}
    echo "Retrived the Region Name: ${REGION} from meta-data" | logger -t "${LOG}"
 fi
+
 TIMEZONE=$( timezone ${REGION} )
 if [[ $? -ne 255 ]]; then
    echo "Find the correct timezone: '${TIMEZONE}' for '${REGION}'" | logger -t "${LOG}"
 else
-   echo "Unable to retrive correct TIMEZONE for '${REGION}': keep current" | logger -t ${LOG}
+   echo "Unable to retrive correct TIMEZONE for '${REGION}': keep current" | logger -t "${LOG}"
    exit 1
 fi
+
 CLOCKFILE="/etc/sysconfig/clock"
 ESCAPED_TIMEZONE=${TIMEZONE//\//\\\/}
 if grep -Fxq "ZONE=\"${TIMEZONE}\"" ${CLOCKFILE}
